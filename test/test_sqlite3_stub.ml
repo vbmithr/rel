@@ -72,5 +72,25 @@ let test_fold_raise_resets =
   Test.(list T.bool) (ok (Rel_sqlite3.fold db st List.cons [])) [true];
   ()
 
+let test_fold_nested =
+  Test.test "Rel_sqlite3.fold: nested fold on the same SQL" @@ fun () ->
+  let db = mem () in
+  let st =
+    Rel_sql.Stmt.v "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL \
+                    SELECT x + 1 FROM c WHERE x < 3) SELECT x FROM c"
+      ~rev_args:[] ~result:Rel.Row.(t1 (int "x"))
+  in
+  let inner () = ok (Rel_sqlite3.fold db st (fun x acc -> x :: acc) []) in
+  let all =
+    ok (Rel_sqlite3.fold db st (fun x acc -> (x, List.rev (inner ())) :: acc) [])
+  in
+  let one = [1; 2; 3] in
+  Test.(list (T.pair T.int (T.list T.int))) (List.rev all)
+    [1, one; 2, one; 3, one];
+  (* The cached statement is usable again afterwards. *)
+  Test.(list T.int) (List.rev (inner ())) one;
+  ok (Rel_sqlite3.close db);
+  ()
+
 let main () = Test.main @@ fun () -> Test.autorun ()
 let () = if !Sys.interactive then () else (exit (main ()))

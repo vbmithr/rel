@@ -319,7 +319,8 @@ module Stmt' = struct
   type t =
     { stmt : Tsqlite3.stmt;
       col_count : int;
-      mutable finalized : bool; }
+      mutable finalized : bool;
+      mutable busy : bool; (* bound and not yet stopped *) }
 
   type 'r step = t * 'r Rel_sql.Stmt.t
 
@@ -338,8 +339,7 @@ module Stmt' = struct
   | Error rc -> error (db_error rc db)
   | Ok stmt ->
       let col_count = Tsqlite3.column_count stmt in
-      let finalized = false in
-      { stmt; col_count; finalized }
+      { stmt; col_count; finalized = false; busy = false }
 
   let rec bind_arg st idx (Rel_sql.Stmt.Arg (t, v)) =
     match Type.Repr.of_t t with
@@ -377,7 +377,10 @@ module Stmt' = struct
   let bind s st =
     validate s;
     match Tsqlite3.reset s.stmt with
-    | 0 -> bind_args s.stmt (List.rev (Rel_sql.Stmt.rev_args st))
+    | 0 ->
+        s.busy <- true;
+        (try bind_args s.stmt (List.rev (Rel_sql.Stmt.rev_args st)) with
+        | exn -> s.busy <- false; raise exn)
     | rc -> error (stmt_error rc s.stmt)
 
   let rec unpack_col_type :
@@ -424,6 +427,7 @@ module Stmt' = struct
   let stop s =
     (* N.B. we need to reset otherwise things like VACUUM think queries
        are still going on. *)
+    s.busy <- false;
     ignore (Tsqlite3.clear_bindings s.stmt);
     ignore (Tsqlite3.reset s.stmt)
 
@@ -488,6 +492,17 @@ module Cache = struct
   let stmt db sql = match find db sql with
   | Some s -> s
   | None -> let s = Stmt'.prepare db.db sql in add db sql s; s
+
+  (* If the cached statement is mid-evaluation (a [fold] callback running
+     the same SQL) binding it would reset the outer evaluation. Use a
+     temporary statement instead. *)
+  let with_stmt db sql f =
+    let s = stmt db sql in
+    if not s.busy then f s else
+    let tmp = Stmt'.prepare db.db sql in
+    match f tmp with
+    | v -> Stmt'.finalize_noerr tmp; v
+    | exception exn -> Stmt'.finalize_noerr tmp; raise exn
 end
 
 type mode = Tsqlite3.mode = Read | Read_write | Read_write_create | Memory
@@ -537,7 +552,7 @@ let exec_sql db sql =
 let fold db st f acc =
   validate db;
   try
-    let s = Cache.stmt db (Rel_sql.Stmt.src st) in
+    Cache.with_stmt db (Rel_sql.Stmt.src st) @@ fun s ->
     Stmt'.bind s st; Ok (Stmt'.fold s st f acc)
   with
   | Stmt'.Error e -> Error e
@@ -545,7 +560,7 @@ let fold db st f acc =
 let first db st =
   validate db;
   try
-    let s = Cache.stmt db (Rel_sql.Stmt.src st) in
+    Cache.with_stmt db (Rel_sql.Stmt.src st) @@ fun s ->
     Stmt'.bind s st; Ok (Stmt'.first s st)
   with
   | Stmt'.Error e -> Error e
@@ -553,7 +568,7 @@ let first db st =
 let exec db st =
   validate db;
   try
-    let s = Cache.stmt db (Rel_sql.Stmt.src st) in
+    Cache.with_stmt db (Rel_sql.Stmt.src st) @@ fun s ->
     Stmt'.bind s st; Ok (Stmt'.exec s)
   with
   | Stmt'.Error e -> Error e
@@ -594,7 +609,7 @@ let explain ?(query_plan = false) db st =
     let rev_args = Rel_sql.Stmt.rev_args st in
     let result = Row.(t1 (text "explanation")) in
     let st = Rel_sql.Stmt.v src ~rev_args ~result in
-    let s = Cache.stmt db src in (* XXX skip the cache ? *)
+    Cache.with_stmt db src @@ fun s -> (* XXX skip the cache ? *)
     Stmt'.bind s st;
     let lines = List.rev (Stmt'.fold s st List.cons []) in
     Ok (String.concat "\n" lines)

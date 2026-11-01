@@ -350,7 +350,12 @@ type mutex =
 
 type t
 (** The type for SQLite3 connections. {b Warning.} [Rel_sqlite3]'s
-    abstraction of connections is not thread-safe.  *)
+    abstraction of connections is not thread-safe: a connection and its
+    statement cache must not be used by two threads or domains at once.
+    This holds whatever the {!mutex} mode; with {!No}, concurrent use of
+    one connection is moreover a data race inside SQLite itself. Connections
+    and statements are not finalised by the GC, {!close} and
+    {!Stmt.finalize} must be called.  *)
 
 val open' :
   ?foreign_keys:bool -> ?stmt_cache_size:int -> ?vfs:string -> ?uri:bool ->
