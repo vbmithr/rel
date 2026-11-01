@@ -324,10 +324,15 @@ module Stmt' = struct
   type 'r step = t * 'r Rel_sql.Stmt.t
 
   let validate s = if s.finalized then invalid_arg "finalized statement" else ()
-  let finalize s = match Tsqlite3.finalize s.stmt with
-  | 0 -> s.finalized <- true | rc -> error (stmt_error rc s.stmt)
+  let finalize s =
+    (* The statement is freed whatever the result: don't touch it after. *)
+    s.finalized <- true;
+    match Tsqlite3.finalize s.stmt with
+    | 0 -> ()
+    | rc -> error (Error.v rc (Error.code_to_string rc))
 
-  let finalize_noerr s = try finalize s with Failure _ -> ()
+  let finalize_noerr s = if s.finalized then () else try finalize s with
+  | Error _ | Failure _ -> ()
 
   let prepare db sql = match Tsqlite3.prepare db sql with
   | Error rc -> error (db_error rc db)
@@ -429,7 +434,9 @@ module Stmt' = struct
 
   let fold s st f acc =
     let rec loop s st f acc = match Tsqlite3.step s.stmt with
-    | 100 (* SQLITE_ROW *) -> loop s st f (f (unpack_row s st) acc)
+    | 100 (* SQLITE_ROW *) ->
+        let acc = try f (unpack_row s st) acc with exn -> stop s; raise exn in
+        loop s st f acc
     | 101 (* SQLITE_DONE *) -> stop s; acc
     | rc -> let err = stmt_error rc s.stmt in stop s; error err
     in
@@ -456,8 +463,9 @@ module Cache = struct
   let create size = Lru_map.create ~random:true size
   let clear db =
     let drop _ st = Stmt'.finalize_noerr st in
-    Lru_map.iter drop db.stmt_cache;
-    db.stmt_cache <- create db.stmt_cache_size
+    let old = db.stmt_cache in
+    db.stmt_cache <- create db.stmt_cache_size;
+    Lru_map.iter drop old
 
   let drop db ~count =
     let rec loop db count =
@@ -503,7 +511,9 @@ let open'
 let close db =
   validate db;
   Cache.clear db;
-  match Tsqlite3.close db.db with 0 -> Ok () | rc -> Error (db_error rc db.db)
+  match Tsqlite3.close db.db with
+  | 0 -> db.closed <- true; Ok ()
+  | rc -> Error (db_error rc db.db)
 
 let busy_timeout_ms db dur =
   validate db;
@@ -633,8 +643,10 @@ module Backup = struct
 
   let finish b =
     validate b;
+    (* The backup is freed whatever the result. *)
+    b.finished <- true;
     match Tsqlite3.backup_finish b.backup with
-    | 0 (* SQLITE_OK *)  -> b.finished <- true; Ok () | rc -> error rc
+    | 0 (* SQLITE_OK *)  -> Ok () | rc -> error rc
 
   let step b ?(n = -1) () =
     validate b;

@@ -13,6 +13,7 @@
 #include <assert.h>
 #include <stdbool.h>
 #include <string.h>
+#include <limits.h>
 
 #include <sqlite3.h>
 
@@ -75,9 +76,11 @@ CAMLprim value ocaml_rel_sqlite3_open (value file, value uri, value mode,
 
   caml_release_runtime_system ();
   int rc = sqlite3_open_v2 (filec, &dbc, flags, vfsc);
+  /* SQLite allocates a handle even when open fails; it must be closed. */
+  if (rc != SQLITE_OK && dbc != NULL) { sqlite3_close (dbc); dbc = NULL; }
+  caml_acquire_runtime_system ();
   caml_stat_free (filec);
   if (vfsc != NULL) { caml_stat_free (vfsc); }
-  caml_acquire_runtime_system ();
 
   if (rc == SQLITE_OK)
   {
@@ -95,7 +98,12 @@ CAMLprim value ocaml_rel_sqlite3_open (value file, value uri, value mode,
 
 CAMLprim value ocaml_rel_sqlite3_close (value db)
 {
-  return Val_sqlite3_rc (sqlite3_close (Sqlite3_val (db)));
+  /* close_v2: statements still alive turn the handle into a zombie freed
+     at their finalization instead of failing with SQLITE_BUSY. The slot is
+     cleared so that a repeated close is a no-op. */
+  int rc = sqlite3_close_v2 (Sqlite3_val (db));
+  if (rc == SQLITE_OK) { Sqlite3_val (db) = NULL; }
+  return Val_sqlite3_rc (rc);
 }
 
 CAMLprim value ocaml_rel_sqlite3_errmsg (value db)
@@ -135,8 +143,8 @@ CAMLprim value ocaml_rel_sqlite3_exec (value db, value sql)
   char *sqlc = caml_stat_strdup (String_val (sql));
   caml_release_runtime_system ();
   int rc = sqlite3_exec (dbc, sqlc, NULL, NULL, NULL);
-  caml_stat_free (sqlc);
   caml_acquire_runtime_system();
+  caml_stat_free (sqlc);
   return Val_sqlite3_rc (rc);
 }
 
@@ -164,8 +172,11 @@ CAMLprim value ocaml_rel_sqlite3_prepare (value db, value sql)
   char *sqlc = caml_stat_strdup (String_val (sql));
   caml_release_runtime_system ();
   int rc = sqlite3_prepare_v2 (dbc, sqlc, strlen(sqlc), &stmtc, NULL);
-  caml_stat_free (sqlc);
   caml_acquire_runtime_system();
+  caml_stat_free (sqlc);
+
+  /* Empty or comment-only SQL succeeds with a NULL statement. */
+  if (rc == SQLITE_OK && stmtc == NULL) { rc = SQLITE_MISUSE; }
 
   if (rc == SQLITE_OK)
   {
@@ -182,7 +193,11 @@ CAMLprim value ocaml_rel_sqlite3_prepare (value db, value sql)
 
 CAMLprim value ocaml_rel_sqlite3_finalize (value stmt)
 {
-  return Val_sqlite3_rc (sqlite3_finalize (Sqlite3_stmt_val (stmt)));
+  /* The statement is freed whatever the result code; clear the slot so
+     that a repeated finalize is a no-op (sqlite3_finalize(NULL) is). */
+  sqlite3_stmt *stmtc = Sqlite3_stmt_val (stmt);
+  Sqlite3_stmt_val (stmt) = NULL;
+  return Val_sqlite3_rc (sqlite3_finalize (stmtc));
 }
 
 CAMLprim value ocaml_rel_sqlite3_reset (value stmt)
@@ -244,16 +259,18 @@ CAMLprim value ocaml_rel_sqlite3_bind_double (value stmt, value i, value v)
 CAMLprim value ocaml_rel_sqlite3_bind_text (value stmt, value i, value v)
 {
   return Val_sqlite3_rc
-    (sqlite3_bind_text (Sqlite3_stmt_val (stmt), Int_val (i),
-                        String_val (v), caml_string_length (v),
+    (caml_string_length (v) > INT_MAX ? SQLITE_TOOBIG :
+     sqlite3_bind_text (Sqlite3_stmt_val (stmt), Int_val (i),
+                        String_val (v), (int) caml_string_length (v),
                         SQLITE_TRANSIENT));
 }
 
 CAMLprim value ocaml_rel_sqlite3_bind_blob (value stmt, value i, value v)
 {
   return Val_sqlite3_rc
-    (sqlite3_bind_blob (Sqlite3_stmt_val (stmt), Int_val (i),
-                        String_val (v), caml_string_length (v),
+    (caml_string_length (v) > INT_MAX ? SQLITE_TOOBIG :
+     sqlite3_bind_blob (Sqlite3_stmt_val (stmt), Int_val (i),
+                        String_val (v), (int) caml_string_length (v),
                         SQLITE_TRANSIENT));
 }
 
@@ -270,7 +287,8 @@ CAMLprim value ocaml_rel_sqlite3_column_is_null (value stmt, value i)
 
 CAMLprim value ocaml_rel_sqlite3_column_bool (value stmt, value i)
 {
-  return Val_bool (sqlite3_column_int (Sqlite3_stmt_val (stmt), Int_val (i)));
+  return Val_bool
+    (sqlite3_column_int64 (Sqlite3_stmt_val (stmt), Int_val (i)) != 0);
 }
 
 CAMLprim value ocaml_rel_sqlite3_column_int (value stmt, value i)
@@ -294,16 +312,16 @@ CAMLprim value ocaml_rel_sqlite3_column_text (value stmt, value i)
 {
   sqlite3_stmt *stmtc = Sqlite3_stmt_val (stmt);
   int len = sqlite3_column_bytes (stmtc, Int_val (i));
-  return caml_alloc_initialized_string
-    (len, (char *)sqlite3_column_text (stmtc, Int_val (i)));
+  const char *s = (const char *)sqlite3_column_text (stmtc, Int_val (i));
+  return caml_alloc_initialized_string (s == NULL ? 0 : len, s ? s : "");
 }
 
 CAMLprim value ocaml_rel_sqlite3_column_blob (value stmt, value i)
 {
   sqlite3_stmt *stmtc = Sqlite3_stmt_val (stmt);
   int len = sqlite3_column_bytes (stmtc, Int_val (i));
-  return caml_alloc_initialized_string
-    (len, (char *)sqlite3_column_blob (stmtc, Int_val (i)));
+  const char *s = (const char *)sqlite3_column_blob (stmtc, Int_val (i));
+  return caml_alloc_initialized_string (s == NULL ? 0 : len, s ? s : "");
 }
 
 /* Backups */
@@ -329,9 +347,9 @@ CAMLprim value ocaml_rel_sqlite3_backup_init
   char *snamec = caml_stat_strdup (String_val (sname));
   caml_release_runtime_system ();
   bc = sqlite3_backup_init (dstc, dnamec, srcc, snamec);
+  caml_acquire_runtime_system ();
   caml_stat_free (dnamec);
   caml_stat_free (snamec);
-  caml_acquire_runtime_system ();
 
   if (bc)
   {
@@ -349,7 +367,10 @@ CAMLprim value ocaml_rel_sqlite3_backup_init
 
 CAMLprim value ocaml_rel_sqlite3_backup_finish (value b)
 {
-  return Val_sqlite3_rc (sqlite3_backup_finish (Sqlite3_backup_val (b)));
+  /* Freed whatever the result code (it reports earlier step errors). */
+  sqlite3_backup *bc = Sqlite3_backup_val (b);
+  Sqlite3_backup_val (b) = NULL;
+  return Val_sqlite3_rc (sqlite3_backup_finish (bc));
 }
 
 CAMLprim value ocaml_rel_sqlite3_backup_step (value b, value n)
