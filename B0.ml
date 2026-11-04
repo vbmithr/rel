@@ -65,6 +65,10 @@ let test_sql =
 let test_sqlite3_stub =
   test ~/"test/test_sqlite3_stub.ml" ~requires:[rel_sqlite3] ~srcs:schemas
 
+let test_sqlite3_extension =
+  test ~/"test/test_sqlite3_extension.ml" ~requires:[rel_sqlite3]
+    ~srcs:[`File ~/"test/test_sqlite3_extension_stubs.c"]
+
 let test_sqlite3_chinook =
   test ~/"test/test_sqlite3_chinook.ml" ~requires:[rel_sqlite3] ~srcs:chinook
 

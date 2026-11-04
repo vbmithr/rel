@@ -89,6 +89,10 @@ module Tsqlite3 = struct
     =
     _open' ~vfs ~uri ~mode ~mutex f
 
+  type extension
+  external apply_extension : t -> extension -> rc * string =
+    "ocaml_rel_sqlite3_apply_extension"
+
   external close : t -> rc = "ocaml_rel_sqlite3_close"
   external extended_errcode : t -> int = "ocaml_rel_sqlite3_extended_errcode"
   external errmsg : t -> string = "ocaml_rel_sqlite3_errmsg"
@@ -534,6 +538,16 @@ let busy_timeout_ms db dur =
   validate db;
   match Tsqlite3.busy_timeout db.db dur with
   | 0 -> Ok () | rc -> Error (db_error rc db.db)
+
+module Extension = struct
+  type connection = t
+  type t = Tsqlite3.extension
+
+  let apply db extension =
+    validate db;
+    let rc, message = Tsqlite3.apply_extension db.db extension in
+    if rc = 0 then Ok () else Error (Error.v rc message)
+end
 
 let changes db = validate db; Tsqlite3.changes db.db
 let last_insert_rowid db = validate db; Tsqlite3.last_insert_rowid db.db

@@ -386,6 +386,23 @@ val close : t -> (unit, error) result
     {{!Rel_sqlite3.Stmt}low-level} statement interface and forget to
     dispose the statements before closing the database. *)
 
+(** Statically linked SQLite extensions. *)
+module Extension : sig
+  type connection = t
+  type t
+  (** An opaque initializer for a statically linked extension. Extension
+      authors create values using the installed [rel_sqlite3_extension.h]
+      header and their own OCaml C primitive. The function pointer and any
+      code it references must remain valid for the process lifetime. *)
+
+  val apply : connection -> t -> (unit, error) result
+  (** [apply db extension] initializes [extension] on [db]. Apply before
+      preparing statements that use its functions or collations. Whether
+      repeated application is supported depends on the extension. Errors
+      preserve the initializer's message, if supplied. As with other
+      connection operations, callers must serialize access to [db]. *)
+end
+
 val busy_timeout_ms : t -> int -> (unit, error) result
 (** [busy_timout_ms db d] sets
     {{:https://sqlite.org/c3ref/busy_timeout.html}the busy timeout} to [d]

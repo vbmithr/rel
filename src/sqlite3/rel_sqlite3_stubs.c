@@ -21,6 +21,11 @@
 #error "Unsupported SQLite version, at least 3.27.2 is needed"
 #endif
 
+typedef int (*rel_sqlite3_extension_init)
+  (sqlite3 *, char **, const sqlite3_api_routines *);
+#define Rel_sqlite3_extension_val(v) \
+  (*((rel_sqlite3_extension_init *) Data_abstract_val(v)))
+
 #define Sqlite3_val(v) (*((sqlite3 **) Data_abstract_val(v)))
 #define Sqlite3_stmt_val(v) (*((sqlite3_stmt **) Data_abstract_val(v)))
 #define Sqlite3_backup_val(v) (*((sqlite3_backup **) Data_abstract_val(v)))
@@ -94,6 +99,22 @@ CAMLprim value ocaml_rel_sqlite3_open (value file, value uri, value mode,
     Store_field (ret, 0, Val_sqlite3_rc (rc));
   }
   CAMLreturn (ret);
+}
+
+CAMLprim value ocaml_rel_sqlite3_apply_extension (value db, value extension)
+{
+  CAMLparam2 (db, extension);
+  CAMLlocal2 (result, message);
+  rel_sqlite3_extension_init init = Rel_sqlite3_extension_val (extension);
+  char *error = NULL;
+  int rc = init (Sqlite3_val (db), &error, NULL);
+  message = caml_copy_string (error != NULL ? error :
+                              (rc == SQLITE_OK ? "" : sqlite3_errstr (rc)));
+  sqlite3_free (error);
+  result = caml_alloc_tuple (2);
+  Store_field (result, 0, Val_int (rc));
+  Store_field (result, 1, message);
+  CAMLreturn (result);
 }
 
 CAMLprim value ocaml_rel_sqlite3_close (value db)

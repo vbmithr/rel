@@ -13,6 +13,8 @@ let () =
     Pkg.mllib "src/cli/rel_cli.mllib" ~dst_dir:"cli";
     Pkg.mllib "src/pool/rel_pool.mllib" ~dst_dir:"pool";
     Pkg.mllib ~cond:sqlite3 "src/sqlite3/rel_sqlite3.mllib" ~dst_dir:"sqlite3";
+    Pkg.lib ~cond:sqlite3 "src/sqlite3/rel_sqlite3_extension.h"
+      ~dst:"sqlite3/rel_sqlite3_extension.h";
     Pkg.clib
       ~cond:sqlite3 "src/sqlite3/librel_sqlite3_stubs.clib"
       ~lib_dst_dir:"sqlite3";
