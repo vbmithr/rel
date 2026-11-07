@@ -75,6 +75,9 @@ let test_sqlite3_chinook =
 let test_sqlite3_checks =
   test ~/"test/test_sqlite3_checks.ml" ~requires:[rel_sqlite3]
 
+let test_sqlite3_strict =
+  test ~/"test/test_sqlite3_strict.ml" ~requires:[rel_sqlite3]
+
 let test_issue_4 = test ~/"test/test_issue_4.ml" ~requires:[rel_sqlite3]
 
 let examples = test ~/"test/examples.ml" ~run:false

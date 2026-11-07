@@ -560,6 +560,15 @@ val dialect : Rel_sql.dialect
 
 (** {1:schema Schema} *)
 
+type 'r Rel.Table.param +=
+| Strict
+(** [Strict] makes a table a {{:https://sqlite.org/stricttables.html}
+    STRICT} table: SQLite then refuses values that do not have the type
+    of their column. Strict tables only allow the [INTEGER], [REAL],
+    [TEXT], [BLOB] and [ANY] column types, so {!Rel.Type.bool},
+    {!Rel.Type.int} and {!Rel.Type.int64} columns are all declared
+    [INTEGER]; {!schema_of_db} reads them back as {!Rel.Type.int}. *)
+
 val schema_of_db :
   ?schema:Schema.name -> t -> (Schema.t * string list, error) result
 (** [schema_of_db db] derives a best-effort schema value for the
@@ -570,6 +579,9 @@ val schema_of_db :
     The returned list of strings is a list of issues to report to the
     end-user that indicate that the resulting schema may not
     faithfully represent [db]. If empty all is well.
+
+    Strict tables have the {!Strict} parameter, which is the only
+    table parameter returned.
 
     SQLite has no pragma for check constraints: table checks are read
     from the table's [CREATE TABLE] statement. Column constraints

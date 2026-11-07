@@ -690,6 +690,11 @@ end
 
 (* SQL *)
 
+type 'r Rel.Table.param += Strict
+
+let is_strict t =
+  List.exists (function Strict -> true | _ -> false) (Rel.Table.params t)
+
 module Dialect = struct
   let kind = "sqlite3"
 
@@ -826,17 +831,20 @@ module Dialect = struct
       loop (b_len - 1) b 0 s 2
     with Failure e -> Error e
 
-  let rec type_of_type : type a. a Type.Repr.t -> string * bool = function
-  (* N.B. if we create databases in strict mode we can no longer
-     distinguish between the first three types. *)
-  | Bool -> "BOOL", true (* not null *)
+  let rec type_of_type :
+    type a. strict:bool -> a Type.Repr.t -> string * bool
+  =
+  (* N.B. strict tables only allow INTEGER, REAL, TEXT, BLOB and ANY, so
+     the first three types can no longer be distinguished. *)
+  fun ~strict -> function
+  | Bool -> (if strict then "INTEGER" else "BOOL"), true (* not null *)
   | Int -> "INTEGER", true
-  | Int64 -> "BIGINT", true
+  | Int64 -> (if strict then "INTEGER" else "BIGINT"), true
   | Float -> "REAL", true
   | Text -> "TEXT", true
   | Blob -> "BLOB", true
-  | Option t -> fst (type_of_type t), false
-  | Coded c -> type_of_type (Type.Repr.of_t (Type.Coded.repr c))
+  | Option t -> fst (type_of_type ~strict t), false
+  | Coded c -> type_of_type ~strict (Type.Repr.of_t (Type.Coded.repr c))
   | Custom c -> Type.Custom.invalid_unknown c
 
   let rec const_of_literal :
@@ -881,10 +889,10 @@ module Dialect = struct
           invalid_arg (strf "invalid %s constant %s" name e))
   | Custom c -> Rel.Type.Custom.invalid_unknown c
 
-  let col_def (Col.Def col) =
+  let col_def ~strict (Col.Def col) =
     let name = sqlid (Col.name col) in
     let type' = Type.Repr.of_t (Rel.Col.type' col) in
-    let typ, not_null = type_of_type type' in
+    let typ, not_null = type_of_type ~strict type' in
     let not_null = if not_null then " NOT NULL" else "" in
     let default = match Col.default col with
     | None -> ""
@@ -925,7 +933,8 @@ module Dialect = struct
     let if_not_exists = if_not_exists_ext if_not_exists  in
     let name = Table.name t in
     let name = sqlid_in_schema ?schema name in
-    let cols = List.map col_def (Table.cols t) in
+    let strict = is_strict t in
+    let cols = List.map (col_def ~strict) (Table.cols t) in
     let uniques = List.map unique_key (Table.unique_keys t) in
     let primary_key = match Table.primary_key t with
     | None -> []
@@ -936,11 +945,10 @@ module Dialect = struct
     let checks = List.map check (Table.checks t) in
     let defs = cols @ primary_key @ uniques @ fks @ checks in
     let sql =
-      (* Would be nice to create tables in STRICT mode but then we can no
-         longer distinguish between bool, int and int64 *)
-      pp_strf "@[<v2>CREATE TABLE%s %s (@,%a@]@,);"
+      pp_strf "@[<v2>CREATE TABLE%s %s (@,%a@]@,)%s;"
         if_not_exists name
         (Format.pp_print_list ~pp_sep:pp_comma Format.pp_print_string) defs
+        (if strict then " STRICT" else "")
     in
     Rel_sql.Stmt.(func sql @@ unit)
 
@@ -1381,14 +1389,26 @@ let check_of_def def =
 
 let table_checks sql = List.filter_map check_of_def (table_defs sql)
 
+let table_strict db name =
+  let stmt =
+    let sql =
+      "SELECT strict FROM pragma_table_list (?) WHERE schema = 'main'"
+    in
+    Rel_sql.Stmt.(func sql (text @-> (ret Rel.Row.(t1 (bool "strict")))))
+  in
+  let* strict = first db (stmt name) in
+  Ok (Option.value ~default:false strict)
+
 let table db name sql issues =
   let* cols, primary_key, issues = table_cols db name issues in
   let row = Rel.Row.Repr.row_of_cols cols in
   let* indices, unique_keys = table_indices db name in
   let* foreign_keys, issues = table_foreign_keys db name issues in
   let checks = table_checks sql in
+  let* strict = table_strict db name in
+  let params = if strict then [Strict] else [] in
   Ok (Rel.Table.make name row ?primary_key ~unique_keys ~foreign_keys ~indices
-        ~checks, issues)
+        ~checks ~params, issues)
 
 let rec tables db ts issues = function
 | [] -> Ok (List.rev ts, List.rev issues)
