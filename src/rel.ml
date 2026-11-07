@@ -396,6 +396,22 @@ module Table = struct
       Col.list_equal_names (cols i0) (cols i1)
   end
 
+  module Check = struct
+    type name = string
+    type 'r t = { name : name option; expr : string }
+
+    let make ?name expr = { name; expr }
+    let name (c : 'r t) = c.name
+    let expr c = c.expr
+
+    let key c =
+      (* Unnamed checks are identified by their expression. *)
+      match c.name with None -> "(" ^ c.expr ^ ")" | Some n -> n
+
+    let equal c0 c1 =
+      Option.equal String.equal c0.name c1.name && String.equal c0.expr c1.expr
+  end
+
   type 'r param = ..
   type action = [ `Set_null | `Set_default | `Cascade | `Restrict ]
 
@@ -416,15 +432,17 @@ module Table = struct
       unique_keys : 'r unique_key list;
       mutable (* for cycle breaking *) foreign_keys : 'r foreign_key list;
       params : 'r param list;
-      indices : 'r Index.t list; }
+      indices : 'r Index.t list;
+      checks : 'r Check.t list; }
 
   type def = Def : 'r t -> def
 
   let make
-      ?(params = []) ?(indices = []) ?(foreign_keys = []) ?(unique_keys = [])
-      ?primary_key name row
+      ?(params = []) ?(checks = []) ?(indices = []) ?(foreign_keys = [])
+      ?(unique_keys = []) ?primary_key name row
     =
-    { name; row; primary_key; unique_keys; foreign_keys; params; indices }
+    { name; row; primary_key; unique_keys; foreign_keys; params; indices;
+      checks }
 
   let name t = t.name
   let name' (Def t) = t.name
@@ -434,6 +452,7 @@ module Table = struct
   let foreign_keys t = t.foreign_keys
   let set_foreign_keys t fks = t.foreign_keys <- fks
   let indices t = t.indices
+  let checks t = t.checks
   let params t = t.params
   let with_name t name = { t with name }
 
@@ -514,12 +533,14 @@ module Table = struct
   | Add_foreign_key : 'r foreign_key -> 'r change
   | Add_primary_key : 'r primary_key -> 'r change
   | Add_unique_key : 'r unique_key -> 'r change
+  | Add_check : 'r Check.t -> 'r change
   | Create_index : 'r Index.t -> 'r change
   | Drop_column : Col.name -> 'r change
   | Drop_foreign_key : 'a foreign_key -> 'r change
   | Drop_index : Index.name -> 'r change
   | Drop_primary_key : 'r change
   | Drop_unique_key : 'a unique_key -> 'r change
+  | Drop_check : 'a Check.t -> 'r change
   | Set_column_default : 'r Col.def -> 'r change
   | Set_column_type : 'r Col.def * 'b Col.def -> 'r change
   | Set_column_pos_after : 'r Col.def * 'r Col.def option -> 'r change
@@ -635,12 +656,29 @@ module Table = struct
     in
     loop cs srcs (indices dst)
 
+  let check_changes cs ~src ~dst =
+    let drop (_, c) = Drop_check c in
+    let srcs = List.map (fun c -> Check.key c, c) (checks src) in
+    let rec loop cs srcs = function
+    | [] -> List.rev_append (List.map drop srcs) cs
+    | dst :: dsts ->
+        let src, srcs = assoc_find_remove (Check.key dst) srcs in
+        let cs = match src with
+        | None -> Add_check dst :: cs
+        | Some src when Check.equal src dst -> cs
+        | Some src -> Add_check dst :: Drop_check src :: cs
+        in
+        loop cs srcs dsts
+    in
+    loop cs srcs (checks dst)
+
   let changes ~src ~dst =
     let cs = columns_changes [] ~src ~dst in
     let cs = primary_key_changes cs ~src ~dst in
     let cs = unique_key_changes cs ~src ~dst in
     let cs = foreign_key_changes cs ~src ~dst in
     let cs = index_changes cs ~src ~dst in
+    let cs = check_changes cs ~src ~dst in
     List.rev cs
 
   let pp_change ppf c =
@@ -667,6 +705,8 @@ module Table = struct
         Fmt.pf ppf "ADD PRIMARY KEY %a" pp_cols k
     | Add_unique_key u ->
         Fmt.pf ppf "ADD UNIQUE KEY %a" pp_cols (Unique_key.cols u)
+    | Add_check c ->
+        Fmt.pf ppf "ADD CHECK %s" (Check.key c)
     | Create_index i ->
         Fmt.pf ppf "CREATE INDEX %s" (Index.get_name ~table_name:"???" i)
     | Drop_column c ->
@@ -679,6 +719,8 @@ module Table = struct
         Fmt.pf ppf "DROP PRIMARY KEY"
     | Drop_unique_key u ->
         Fmt.pf ppf "DROP UNIQUE KEY %a" pp_cols (Unique_key.cols u)
+    | Drop_check c ->
+        Fmt.pf ppf "DROP CHECK %s" (Check.key c)
     | Set_column_default (Col.Def c) ->
         Fmt.pf ppf "COLUMN %s %a" (Col.name c)
           (pp_default (Col.type' c)) (Col.default c)
@@ -864,6 +906,13 @@ module Schema = struct
       List.map k (Table.unique_keys t)
     in
     let indices = List.map (rename_index_cols ~map) (Table.indices t) in
+    (* Checks are SQL expressions, column renames are not applied to them. *)
+    let checks =
+      let c c =
+        Table.Check.make ?name:(Table.Check.name c) (Table.Check.expr c)
+      in
+      List.map c (Table.checks t)
+    in
     (* let params = Table.params t in (* Won't type *) *)
     let foreign_keys =
       let self_col_map = map in
@@ -872,6 +921,7 @@ module Schema = struct
     in
     let t =
       Table.make name row ?primary_key ~unique_keys ~foreign_keys ~indices
+        ~checks
     in
     cs, Table.Def t
 
@@ -1202,14 +1252,28 @@ module Schema = struct
         Fmt.pf ppf "@[<2>let indices =@ [@[<v>%a@]] in@]@,"
           (Fmt.list ~pp_sep:pp_semi pp_index) is
     in
-    Fmt.pf ppf "@[<v2>let table =@,%a%a%a%aTable.make %S %s%s%s%s @@@@@,%a@]"
+    let pp_checks ppf t = match Table.checks t with
+    | [] -> () | cs ->
+        let pp_check ppf c =
+          let pp_name ppf c = match Table.Check.name c with
+          | None -> () | Some n -> Fmt.pf ppf " ~name:%S" n
+          in
+          Fmt.pf ppf "@[<2>Table.Check.make%a@ %S@]"
+            pp_name c (Table.Check.expr c)
+        in
+        Fmt.pf ppf "@[<2>let checks =@ [@[<v>%a@]] in@]@,"
+          (Fmt.list ~pp_sep:pp_semi pp_check) cs
+    in
+    Fmt.pf ppf
+      "@[<v2>let table =@,%a%a%a%a%aTable.make %S %s%s%s%s%s @@@@@,%a@]"
       pp_primary_key t pp_unique_keys t pp_foreign_keys t
-      pp_indices t
+      pp_indices t pp_checks t
       (Table.name t)
       (if Table.primary_key t = None then "" else " ~primary_key")
       (if Table.unique_keys t = [] then "" else " ~unique_keys")
       (if Table.foreign_keys t = [] then "" else " ~foreign_keys")
       (if Table.indices t = [] then "" else " ~indices")
+      (if Table.checks t = [] then "" else " ~checks")
       pp_row t
 
   let pp_table_intf kind ppf (Table.Def t) =

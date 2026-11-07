@@ -569,4 +569,8 @@ val schema_of_db :
 
     The returned list of strings is a list of issues to report to the
     end-user that indicate that the resulting schema may not
-    faithfully represent [db]. If empty all is well. *)
+    faithfully represent [db]. If empty all is well.
+
+    SQLite has no pragma for check constraints: table checks are read
+    from the table's [CREATE TABLE] statement. Column constraints
+    such as [a INTEGER CHECK (a > 0)] are not read. *)

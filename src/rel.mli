@@ -634,10 +634,36 @@ module Table : sig
         [table_name] and [cs]. *)
   end
 
+  (** Check constraint definitions.
+
+      A check represents a SQL CHECK constraint on a table: an SQL
+      expression every row must satisfy. *)
+  module Check : sig
+    type name = string
+    (** The type for check constraint names. *)
+
+    type 'r t
+    (** The type for checks on a table with rows represented by ['r]. *)
+
+    val make : ?name:name -> string -> 'r t
+    (** [make ?name expr] is a check that every row satisfies the SQL
+        expression [expr], named [name] if specified. [expr] is
+        written in the SQL of the database, as in a [CREATE TABLE]
+        statement, and is not interpreted: quote column names that need
+        it and remember it on column renames. *)
+
+    val name : 'r t -> name option
+    (** [name c] is the name of [c] (if any). *)
+
+    val expr : 'r t -> string
+    (** [expr c] is the SQL expression of [c]. *)
+  end
+
   val make :
-    ?params:'r param list -> ?indices:'r Index.t list ->
-    ?foreign_keys:'r Foreign_key.t list -> ?unique_keys:'r Unique_key.t list ->
-    ?primary_key:'r Primary_key.t -> name -> 'r Row.t -> 'r t
+    ?params:'r param list -> ?checks:'r Check.t list ->
+    ?indices:'r Index.t list -> ?foreign_keys:'r Foreign_key.t list ->
+    ?unique_keys:'r Unique_key.t list -> ?primary_key:'r Primary_key.t ->
+    name -> 'r Row.t -> 'r t
   (** [make name row] is a table definition with:
       {ul
       {- [name], the name of the table.}
@@ -646,6 +672,7 @@ module Table : sig
       {- [unique_keys], a description of unique key constraints (if any).}
       {- [foreign_keys], a description of foreign keys (if any).}
       {- [indices], a description of table indices (if any).}
+      {- [checks], a description of check constraints (if any).}
       {- [params], a list of parameters for the table}}
 
       {b Note.} For now the module does not check that the columns
@@ -678,6 +705,9 @@ module Table : sig
   val indices : 'r t -> 'r Index.t list
   (** [indices t] are the indices of table [t]. *)
 
+  val checks : 'r t -> 'r Check.t list
+  (** [checks t] are the check constraints of table [t]. *)
+
   val params : 'r t -> 'r param list
   (** [name t] are the parameters of [t]. *)
 
@@ -705,12 +735,14 @@ module Table : sig
   | Add_foreign_key : 'r Foreign_key.t -> 'r change
   | Add_primary_key : 'r Primary_key.t -> 'r change
   | Add_unique_key : 'r Unique_key.t -> 'r change
+  | Add_check : 'r Check.t -> 'r change
   | Create_index : 'r Index.t -> 'r change
   | Drop_column : Col.name -> 'r change
   | Drop_foreign_key : 'a Foreign_key.t -> 'r change
   | Drop_index : Index.name -> 'r change
   | Drop_primary_key : 'r change
   | Drop_unique_key : 'a Unique_key.t -> 'r change
+  | Drop_check : 'a Check.t -> 'r change
   | Set_column_default : 'r Col.def -> 'r change
       (** The given column default changed. *)
   | Set_column_type : 'r Col.def * 'b Col.def -> 'r change

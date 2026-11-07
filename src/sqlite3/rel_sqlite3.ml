@@ -915,6 +915,12 @@ module Dialect = struct
   let unique_key k =
     pp_strf "UNIQUE (@[<h>%a@])" pp_col_names (Table.Unique_key.cols k)
 
+  let check c =
+    let name = match Table.Check.name c with
+    | None -> "" | Some n -> strf "CONSTRAINT %s " (sqlid n)
+    in
+    strf "%sCHECK (%s)" name (Table.Check.expr c)
+
   let create_table ?schema ?if_not_exists t =
     let if_not_exists = if_not_exists_ext if_not_exists  in
     let name = Table.name t in
@@ -927,7 +933,8 @@ module Dialect = struct
                     pp_col_names (Table.Primary_key.cols pk)]
     in
     let fks = List.map (foreign_key ?schema t) (Table.foreign_keys t) in
-    let defs = cols @ primary_key @ uniques @ fks in
+    let checks = List.map check (Table.checks t) in
+    let defs = cols @ primary_key @ uniques @ fks @ checks in
     let sql =
       (* Would be nice to create tables in STRICT mode but then we can no
          longer distinguish between bool, int and int64 *)
@@ -1262,18 +1269,131 @@ let table_indices db tname =
   let* specs = fold db (stmt tname) List.cons [] in
   indices [] [] specs (* No List.rev, seems ids are in rev source order. *)
 
-let table db name issues =
+(* SQLite has no pragma for check constraints: they are read from the
+   CREATE TABLE statement it stores. The scanner skips string literals,
+   quoted identifiers and comments, and only looks at the table
+   constraints, the top-level definitions of the column list. *)
+
+let table_defs sql =
+  let len = String.length sql in
+  let rec skip_quoted close i = (* [i] is after the opening quote *)
+    if i >= len then len else
+    if sql.[i] <> close then skip_quoted close (i + 1) else
+    if close <> ']' && i + 1 < len && sql.[i + 1] = close
+    then skip_quoted close (i + 2) else i + 1
+  in
+  let rec skip_line i =
+    if i >= len || sql.[i] = '\n' then i else skip_line (i + 1)
+  in
+  let rec skip_block i =
+    if i + 1 >= len then len else
+    if sql.[i] = '*' && sql.[i + 1] = '/' then i + 2 else skip_block (i + 1)
+  in
+  (* [next i] is [Some (j, keep)] if a lexeme that does not nest starts
+     at [i] and ends before [j]; [keep] is [false] for comments. *)
+  let next i = match sql.[i] with
+  | '\'' | '"' | '`' as q -> Some (skip_quoted q (i + 1), true)
+  | '[' -> Some (skip_quoted ']' (i + 1), true)
+  | '-' when i + 1 < len && sql.[i + 1] = '-' ->
+      Some (skip_line (i + 2), false)
+  | '/' when i + 1 < len && sql.[i + 1] = '*' ->
+      Some (skip_block (i + 2), false)
+  | _ -> None
+  in
+  let rec start i = (* after the opening parenthesis of the column list *)
+    if i >= len then None else
+    match next i with
+    | Some (i, _) -> start i
+    | None -> if sql.[i] = '(' then Some (i + 1) else start (i + 1)
+  in
+  let def = Buffer.create 256 in
+  let cut acc = let d = Buffer.contents def in Buffer.clear def; d :: acc in
+  let rec defs acc depth i =
+    if i >= len then List.rev acc else
+    match next i with
+    | Some (j, keep) ->
+        if keep then Buffer.add_string def (String.sub sql i (j - i))
+        else Buffer.add_char def ' ';
+        defs acc depth j
+    | None ->
+        match sql.[i] with
+        | ')' when depth = 0 -> List.rev (cut acc)
+        | ',' when depth = 0 -> defs (cut acc) 0 (i + 1)
+        | c ->
+            Buffer.add_char def c;
+            let depth = match c with
+            | '(' -> depth + 1 | ')' -> depth - 1 | _ -> depth
+            in
+            defs acc depth (i + 1)
+  in
+  match start 0 with None -> [] | Some i -> defs [] 0 i
+
+let check_of_def def =
+  (* [def] is a table constraint: [[CONSTRAINT name] CHECK (expr)] or
+     another one, which yields [None]. *)
+  let def = String.trim def in
+  let len = String.length def in
+  let is_space = function ' ' | '\t' | '\n' | '\r' -> true | _ -> false in
+  let is_id_char = function
+  | 'a' .. 'z' | 'A' .. 'Z' | '0' .. '9' | '_' | '$' -> true | _ -> false
+  in
+  let rec spaces i =
+    if i < len && is_space def.[i] then spaces (i + 1) else i
+  in
+  let keyword kw i =
+    let j = i + String.length kw in
+    if j > len || String.uppercase_ascii (String.sub def i (j - i)) <> kw
+    then None else
+    if j < len && is_id_char def.[j] then None else Some (spaces j)
+  in
+  let name i =
+    let quoted close i =
+      let b = Buffer.create 16 in
+      let rec loop i =
+        if i >= len then None else
+        if def.[i] <> close then (Buffer.add_char b def.[i]; loop (i + 1)) else
+        if close <> ']' && i + 1 < len && def.[i + 1] = close
+        then (Buffer.add_char b close; loop (i + 2))
+        else Some (Buffer.contents b, spaces (i + 1))
+      in
+      loop i
+    in
+    let rec bare j =
+      if j < len && is_id_char def.[j] then bare (j + 1) else j
+    in
+    if i >= len then None else
+    match def.[i] with
+    | '"' | '`' | '\'' as q -> quoted q (i + 1)
+    | '[' -> quoted ']' (i + 1)
+    | _ -> let j = bare i in Some (String.sub def i (j - i), spaces j)
+  in
+  let check ?name i = (* [i] is after CHECK *)
+    if i < len && def.[i] = '(' && def.[len - 1] = ')'
+    then Some (Table.Check.make ?name (String.sub def (i + 1) (len - i - 2)))
+    else None
+  in
+  match keyword "CONSTRAINT" 0 with
+  | None -> Option.bind (keyword "CHECK" 0) (fun i -> check i)
+  | Some i ->
+      match name i with
+      | None -> None
+      | Some (name, i) -> Option.bind (keyword "CHECK" i) (check ~name)
+
+let table_checks sql = List.filter_map check_of_def (table_defs sql)
+
+let table db name sql issues =
   let* cols, primary_key, issues = table_cols db name issues in
   let row = Rel.Row.Repr.row_of_cols cols in
   let* indices, unique_keys = table_indices db name in
   let* foreign_keys, issues = table_foreign_keys db name issues in
-  Ok (Rel.Table.make name row ?primary_key ~unique_keys ~foreign_keys ~indices,
-      issues)
+  let checks = table_checks sql in
+  Ok (Rel.Table.make name row ?primary_key ~unique_keys ~foreign_keys ~indices
+        ~checks, issues)
 
 let rec tables db ts issues = function
 | [] -> Ok (List.rev ts, List.rev issues)
-| (name, _sql) :: names ->
-    let* t, issues = table db name issues in
+| (name, sql) :: names ->
+    let* t, issues = table db name sql issues in
     tables db ((Table.Def t) :: ts) issues names
 
 let table_names db =
